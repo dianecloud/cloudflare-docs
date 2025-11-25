@@ -1,0 +1,295 @@
+---
+pcx_content_type: tutorial
+title: Resumable streaming with AI Chat
+sidebar:
+  order: 7
+---
+
+import { TypeScriptExample, WranglerConfig } from "~/components";
+
+The `AIChatAgent` class provides automatic resumable streaming out of the box. When a client disconnects and reconnects during an active stream, the response automatically resumes from where it left off.
+
+This guide shows you how to build a chat application with automatic stream resumption that handles network interruptions gracefully.
+
+## How it works
+
+When you use `AIChatAgent` with `useAgentChat`:
+
+1. **During streaming**: All chunks are automatically persisted to SQLite
+2. **On disconnect**: The stream continues server-side, buffering chunks
+3. **On reconnect**: Client receives all buffered chunks and continues streaming
+
+No additional configuration is required.
+
+## Prerequisites
+
+Before you begin, you will need:
+
+- A [Cloudflare account](https://dash.cloudflare.com/sign-up)
+- [Node.js](https://nodejs.org/) installed (v18 or later)
+- An OpenAI API key (or another AI SDK compatible provider)
+- Basic knowledge of React and TypeScript
+
+## Create your project
+
+1. Create a new project:
+
+```sh
+npm create cloudflare@latest my-resumable-chat
+```
+
+2. Navigate into your project:
+
+```sh
+cd my-resumable-chat
+```
+
+3. Install the required dependencies:
+
+```sh
+npm install agents @ai-sdk/openai ai react react-dom
+```
+
+4. Install development dependencies:
+
+```sh
+npm install -D @cloudflare/vite-plugin @vitejs/plugin-react vite
+```
+
+## Configure your project
+
+Update your `wrangler.jsonc` to configure Durable Objects and assets:
+
+<WranglerConfig>
+
+```jsonc
+{
+  "name": "my-resumable-chat",
+  "compatibility_date": "2025-11-07",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "nodejs_compat_populate_process_env"
+  ],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "dist"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "ChatAgent",
+        "name": "ChatAgent"
+      }
+    ]
+  },
+  "main": "src/server.ts",
+  "migrations": [
+    {
+      "new_sqlite_classes": ["ChatAgent"],
+      "tag": "v1"
+    }
+  ]
+}
+```
+
+</WranglerConfig>
+
+Add your OpenAI API key to `.dev.vars`:
+
+```sh
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+## Build the server
+
+Create `src/server.ts` with your chat agent:
+
+<TypeScriptExample>
+
+```ts
+import { openai } from "@ai-sdk/openai";
+import { type AgentNamespace, routeAgentRequest } from "agents";
+import { AIChatAgent } from "agents/ai-chat-agent";
+import {
+  streamText,
+  convertToModelMessages,
+  createUIMessageStream,
+  createUIMessageStreamResponse
+} from "ai";
+
+type Env = {
+  OPENAI_API_KEY: string;
+  ChatAgent: AgentNamespace<ChatAgent>;
+};
+
+export class ChatAgent extends AIChatAgent<Env> {
+  async onChatMessage() {
+    const stream = createUIMessageStream({
+      execute: async ({ writer }) => {
+        const result = streamText({
+          model: openai("gpt-4o"),
+          messages: convertToModelMessages(this.messages)
+        });
+
+        writer.merge(result.toUIMessageStream());
+      }
+    });
+    return createUIMessageStreamResponse({ stream });
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env) {
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
+  }
+} satisfies ExportedHandler<Env>;
+```
+
+</TypeScriptExample>
+
+The `AIChatAgent` class automatically handles:
+- Persisting stream chunks to SQLite
+- Detecting client reconnections
+- Sending buffered chunks on reconnect
+- Cleaning up old completed streams
+
+## Build the client
+
+Create `src/client.tsx` with your chat interface:
+
+<TypeScriptExample>
+
+```tsx
+import { useState, useRef, useEffect } from "react";
+import { useAgent } from "agents/react";
+import { useAgentChat } from "agents/ai-react";
+
+export default function Chat() {
+  const [input, setInput] = useState("");
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const agent = useAgent({
+    agent: "ChatAgent",
+    name: "my-chat"
+  });
+
+  const { messages, sendMessage, status } = useAgentChat({
+    agent
+    // resume: true is the default - streams automatically resume on reconnect
+  });
+
+  const isStreaming = status === "streaming";
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isStreaming) return;
+
+    const message = input;
+    setInput("");
+
+    await sendMessage({
+      role: "user",
+      parts: [{ type: "text", text: message }]
+    });
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "1rem" }}>
+        {messages.map((message) => (
+          <div key={message.id} style={{ marginBottom: "1rem" }}>
+            <strong>{message.role}: </strong>
+            {message.parts
+              .filter((part) => part.type === "text")
+              .map((part) => (part as { type: "text"; text: string }).text)
+              .join("")}
+          </div>
+        ))}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <form onSubmit={handleSubmit} style={{ padding: "1rem" }}>
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={isStreaming}
+          placeholder="Type your message..."
+          style={{ width: "100%", padding: "0.5rem" }}
+        />
+        <button type="submit" disabled={!input.trim() || isStreaming}>
+          Send
+        </button>
+      </form>
+    </div>
+  );
+}
+```
+
+</TypeScriptExample>
+
+## Under the hood
+
+### Server-side (`AIChatAgent`)
+
+The `AIChatAgent` class automatically:
+
+- Creates SQLite tables for stream chunks and metadata on startup
+- Assigns each stream a unique ID and tracks chunk indices
+- Buffers chunks and flushes to SQLite every 100ms for performance
+- On client connect, checks for active streams and sends `CF_AGENT_STREAM_RESUMING` notification
+- Cleans up old completed streams after 24 hours
+
+### Client-side (`useAgentChat`)
+
+The `useAgentChat` hook automatically:
+
+- Listens for `CF_AGENT_STREAM_RESUMING` notification
+- Sends `CF_AGENT_STREAM_RESUME_ACK` when ready
+- Receives all buffered chunks and reconstructs the message
+- Continues receiving live chunks as they arrive
+
+## Test your application
+
+1. Start the development server:
+
+```sh
+npm run dev
+```
+
+2. Open your browser and navigate to `http://localhost:3000`
+3. Start typing a message that will generate a long response
+4. While the AI is streaming its response, refresh the page
+5. Watch as the stream automatically resumes from where it left off
+
+## Disable resume
+
+If you do not want automatic resume (for example, for short responses), you can disable it:
+
+<TypeScriptExample>
+
+```tsx
+const { messages } = useAgentChat({
+  agent,
+  resume: false // Disable automatic stream resumption
+});
+```
+
+</TypeScriptExample>
+
+## Full example
+
+View the complete working example with a full-featured UI at [github.com/cloudflare/agents](https://github.com/cloudflare/agents/tree/main/examples/resumable-stream-chat).
+
+## Related resources
+
+- [AI Chat Agent API reference](/agents/api-reference/)
+- [Agent class internals](/agents/concepts/agent-class/)
+- [Calling LLMs](/agents/concepts/calling-llms/)
